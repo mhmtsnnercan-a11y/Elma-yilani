@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Elma Yılanı – Canlı</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:Segoe UI,Arial,sans-serif}
+  #c{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);image-rendering:auto}
+  #help{position:fixed;left:8px;bottom:8px;color:#9fb3d9;font-size:12px;background:#000a;padding:6px 10px;border-radius:8px;line-height:1.5}
+</style>
+</head>
+<body>
+<canvas id="c" width="1080" height="1920"></canvas>
+<div id="help" style="display:none">TEST TUŞLARI: 1 Gül · 2 Rosa · 3 Donut · 4 Takip · 5 100 Beğeni · R Yeni tur · M Ses · H Gizle</div>
+<script>
+/* =====================================================================
+   AYARLAR — buradan değiştir
+   ===================================================================== */
+const AYAR = {
+  elmaPerJeton: 5,        // Her hediye: 1 jeton = 5 elma (Gül 1 jeton = 5, Rosa 10 = 50, Donut 30 = 150)
+  takipElma: 10,          // Takip eden başına elma (aynı kişi 1 kez)
+  begeniBasina: 100,      // Kaç beğeni = 1 elma
+  bedavaElmaSn: 60,       // Hiç elma yokken kaç saniyede bir 1 bedava elma düşsün (0 = kapalı)
+  ozelHediye: {},         // İstersen hediye adına göre sabit elma: { "Rose": 5, "Donut": 150 }
+  ses: true,
+  // Üstteki hediye çubuğu (sadece gösterim)
+  bar: [
+    { ikon: '🌹', yazi: '= 5' },
+    { ikon: '💐', yazi: '= 50' },
+    { ikon: '🍩', yazi: '= 150' },
+    { ikon: '👤+', yazi: '= 10' },
+    { ikon: '❤️', yazi: 'x100 = 1' },
+  ],
+};
+
+/* ===================================================================== */
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const VW = 1080, VH = 1920;
+const W = 20, H = 24, N = W * H, CELL = 52;
+const BX = (VW - W * CELL) / 2, BY = 300;
+const params = new URLSearchParams(location.search);
+const LOCAL = /^(localhost|127\.0\.0\.1)$/.test(location.hostname);
+const DEMO = params.has('demo') || location.protocol === 'file:';
+
+function fit() {
+  const s = Math.min(innerWidth / VW, innerHeight / VH);
+  cv.style.width = VW * s + 'px'; cv.style.height = VH * s + 'px';
+}
+addEventListener('resize', fit); fit();
+
+/* ---------- Hamilton döngüsü (her tur rastgele labirent) ---------- */
+let cycle = new Int32Array(N), pos = new Int32Array(N);
+function buildCycle() {
+  const bw = W / 2, bh = H / 2;
+  const right = new Uint8Array(bw * bh), down = new Uint8Array(bw * bh);
+  const seen = new Uint8Array(bw * bh);
+  const stack = [Math.floor(Math.random() * bw * bh)]; seen[stack[0]] = 1;
+  while (stack.length) {           // rastgele DFS ağacı
+    const c = stack[stack.length - 1], x = c % bw, y = (c / bw) | 0, nb = [];
+    if (x > 0 && !seen[c - 1]) nb.push(c - 1);
+    if (x < bw - 1 && !seen[c + 1]) nb.push(c + 1);
+    if (y > 0 && !seen[c - bw]) nb.push(c - bw);
+    if (y < bh - 1 && !seen[c + bw]) nb.push(c + bw);
+    if (!nb.length) { stack.pop(); continue; }
+    const n = nb[(Math.random() * nb.length) | 0];
+    if (n === c + 1) right[c] = 1; else if (n === c - 1) right[n] = 1;
+    else if (n === c + bw) down[c] = 1; else down[n] = 1;
+    seen[n] = 1; stack.push(n);
+  }
+  const adj = Array.from({ length: N }, () => []);
+  const id = (x, y) => y * W + x;
+  const link = (a, b) => { adj[a].push(b); adj[b].push(a); };
+  for (let j = 0; j < bh; j++) for (let i = 0; i < bw; i++) {
+    const b = j * bw + i;
+    const TL = id(2*i, 2*j), TR = id(2*i+1, 2*j), BL = id(2*i, 2*j+1), BR = id(2*i+1, 2*j+1);
+    const hasL = i > 0 && right[b - 1], hasR = right[b], hasU = j > 0 && down[b - bw], hasD = down[b];
+    if (!hasU) link(TL, TR);
+    if (!hasD) link(BL, BR);
+    if (!hasL) link(TL, BL);
+    if (!hasR) link(TR, BR);
+    if (hasR) { link(TR, id(2*i+2, 2*j)); link(BR, id(2*i+2, 2*j+1)); }
+    if (hasD) { link(BL, id(2*i, 2*j+2)); link(BR, id(2*i+1, 2*j+2)); }
+  }
+  let prev = -1, cur = 0;
+  for (let k = 0; k < N; k++) {
+    cycle[k] = cur; pos[cur] = k;
+    const nx = adj[cur][0] !== prev ? adj[cur][0] : adj[cur][1];
+    prev = cur; cur = nx;
+  }
+}
+
+/* ---------- Oyun durumu ---------- */
+const body = new Int32Array(N); let bHead = 0, bLen = 0; // halka tampon: body[(bHead - i + N) % N] = baştan i.
+const occ = new Uint8Array(N);
+const apples = new Map();  // hücre -> {t0, gold}
+let pending = 0, grow = 0, round = 1, eatenRound = 0, totalEaten = 0;
+let state = 'play', winT = 0, lastAppleTime = performance.now();
+let likesTotal = 0, likeApplesGiven = 0;
+const followed = new Set();
+const board = new Map();   // kullanıcı -> {name, pic, apples}
+const feed = [];           // son olaylar
+const toasts = [];
+const parts = [];
+
+function seg(i) { return body[(bHead - i + N * 2) % N]; } // i=0 baş
+function head() { return seg(0); }
+function tail() { return seg(bLen - 1); }
+
+function newRound() {
+  buildCycle();
+  occ.fill(0); apples.clear(); grow = 0; eatenRound = 0;
+  bLen = 0; bHead = -1;
+  for (let k = 0; k < 3; k++) { bHead = (bHead + 1) % N; body[bHead] = cycle[k]; occ[cycle[k]] = 1; bLen++; }
+  state = 'play';
+}
+
+/* ---------- Yapay zeka: Hamilton döngüsü + güvenli kısayol ---------- */
+function think() {
+  const h = head(), ph = pos[h], t = tail();
+  const distTail = (pos[t] - ph + N) % N;
+  let best = -1, bestD = N;
+  for (const a of apples.keys()) { const d = (pos[a] - ph + N) % N; if (d < bestD) { bestD = d; best = a; } }
+  const distFood = best < 0 ? 1 : bestD;
+  let lim = distTail - grow - 4;
+  if (bLen > N * 0.55) lim = 1;
+  let maxS = Math.max(1, Math.min(distFood, lim));
+  const x = h % W, y = (h / W) | 0;
+  const nbs = [];
+  if (x > 0) nbs.push(h - 1); if (x < W - 1) nbs.push(h + 1);
+  if (y > 0) nbs.push(h - W); if (y < H - 1) nbs.push(h + W);
+  let pick = -1, pd = -1;
+  for (const n of nbs) {
+    if (occ[n]) continue;
+    const d = (pos[n] - ph + N) % N;
+    if (d <= maxS && d > pd) { pd = d; pick = n; }
+  }
+  if (pick < 0) pick = cycle[(ph + 1) % N];
+  return pick;
+}
+
+let dir = 1;
+function step() {
+  const n = think();
+  const h = head();
+  dir = n - h;
+  if (apples.has(n)) {
+    const a = apples.get(n); apples.delete(n);
+    grow++; eatenRound++; totalEaten++;
+    burst(n, a.gold); blip();
+  }
+  if (grow > 0) grow--;
+  else { const t = tail(); occ[t] = 0; bLen--; }
+  bHead = (bHead + 1) % N; body[bHead] = n; occ[n] = 1; bLen++;
+  if (bLen >= N) { state = 'win'; winT = performance.now(); fanfare(); confetti(); }
+}
+
+/* ---------- Elma düşürme ---------- */
+function freeCell() {
+  for (let k = 0; k < 40; k++) { const c = (Math.random() * N) | 0; if (!occ[c] && !apples.has(c)) return c; }
+  const list = []; for (let c = 0; c < N; c++) if (!occ[c] && !apples.has(c)) list.push(c);
+  return list.length ? list[(Math.random() * list.length) | 0] : -1;
+}
+function spawnTick(now) {
+  if (state !== 'play' || pending <= 0) return;
+  let k = Math.min(pending, 3 + Math.ceil(pending / 25));
+  while (k-- > 0) {
+    const c = freeCell(); if (c < 0) break;
+    apples.set(c, { t0: now + Math.random() * 120, gold: Math.random() < 0.06 });
+    pending--;
+  }
+}
+
+/* ---------- Olaylar (hediye / takip / beğeni) ---------- */
+function credit(user, n) {
+  if (!user) return;
+  const key = user.id || user.name;
+  const r = board.get(key) || { name: user.name, pic: user.pic, apples: 0 };
+  r.apples += n; r.name = user.name || r.name; if (user.pic) r.pic = user.pic;
+  board.set(key, r);
+}
+function addFeed(txt, n) {
+  feed.unshift({ txt, n, t: performance.now() }); if (feed.length > 4) feed.pop();
+  toasts.push({ txt: txt + '  +' + n + ' 🍎', t: performance.now() }); if (toasts.length > 3) toasts.shift();
+}
+function addApples(n) { pending += n; lastAppleTime = performance.now(); chime(); }
+
+function onGift(e) {
+  const user = e.user || { name: 'Biri' };
+  const count = Math.max(1, e.count || 1);
+  let per = AYAR.ozelHediye[e.giftName];
+  if (per == null) per = Math.max(1, e.diamonds || 1) * AYAR.elmaPerJeton;
+  const n = per * count;
+  addApples(n); credit(user, n);
+  addFeed(`${user.name}: ${e.giftName || 'Hediye'}${count > 1 ? ' x' + count : ''}`, n);
+}
+function onFollow(e) {
+  const user = e.user || { name: 'Biri' };
+  const key = user.id || user.name;
+  if (followed.has(key)) return; followed.add(key);
+  addApples(AYAR.takipElma); credit(user, AYAR.takipElma);
+  addFeed(`${user.name} takip etti`, AYAR.takipElma);
+}
+function onLike(e) {
+  likesTotal += Math.max(1, e.count || 1);
+  const due = Math.floor(likesTotal / AYAR.begeniBasina) - likeApplesGiven;
+  if (due > 0) {
+    likeApplesGiven += due; addApples(due);
+    if (e.user) credit(e.user, 0);
+    addFeed(`${AYAR.begeniBasina * due} beğeni`, due);
+  }
+}
+function handle(m) {
+  if (m.type === 'gift') onGift(m);
+  else if (m.type === 'follow') onFollow(m);
+  else if (m.type === 'like') onLike(m);
+  else if (m.type === 'status') conn = m;
+}
+
+/* ---------- Sunucu bağlantısı ---------- */
+let conn = { ok: false, user: '' };
+function wsConnect() {
+  if (DEMO) return;
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
+  ws.onmessage = ev => { try { handle(JSON.parse(ev.data)); } catch (e) {} };
+  ws.onclose = () => { conn = { ok: false, user: conn.user }; setTimeout(wsConnect, 3000); };
+}
+wsConnect();
+// Ücretsiz sunucu uyumasın diye 4 dakikada bir yokla
+if (!DEMO) setInterval(() => fetch('/ping').catch(() => {}), 240000);
+
+/* ---------- Demo / test ---------- */
+const NAMES = ['Ayşe', 'Mehmet', 'Zeynep', 'Emre', 'Elif', 'Can', 'Selin', 'Burak', 'Deniz', 'Kerem', 'Ece', 'Mert'];
+const rnd = () => { const n = NAMES[(Math.random() * NAMES.length) | 0]; return { id: n, name: n, pic: '' }; };
+const TEST = {
+  1: () => onGift({ user: rnd(), giftName: 'Gül', diamonds: 1, count: 1 + ((Math.random() * 3) | 0) }),
+  2: () => onGift({ user: rnd(), giftName: 'Rosa', diamonds: 10, count: 1 }),
+  3: () => onGift({ user: rnd(), giftName: 'Donut', diamonds: 30, count: 1 }),
+  4: () => onFollow({ user: { ...rnd(), id: Math.random() + '' } }),
+  5: () => onLike({ count: 100, user: rnd() }),
+};
+addEventListener('keydown', e => {
+  unlockAudio();
+  if (TEST[e.key]) TEST[e.key]();
+  else if (e.key === 'r' || e.key === 'R') { newRound(); }
+  else if (e.key === 'm' || e.key === 'M') AYAR.ses = !AYAR.ses;
+  else if (e.key === 'h' || e.key === 'H') { const h = document.getElementById('help'); h.style.display = h.style.display === 'none' ? '' : 'none'; }
+});
+addEventListener('pointerdown', unlockAudio);
+if (DEMO) {
+  (function demo() {
+    const r = Math.random();
+    if (r < 0.55) TEST[1](); else if (r < 0.72) TEST[4](); else if (r < 0.88) TEST[5](); else if (r < 0.97) TEST[2](); else TEST[3]();
+    setTimeout(demo, 1500 + Math.random() * 3000);
+  })();
+  TEST[2]();
+}
+setTimeout(() => { document.getElementById('help').style.display = 'none'; }, 15000);
+
+/* ---------- Ses (WebAudio, dosya gerekmez) ---------- */
+var AC = null, lastBlip = 0;
+function unlockAudio() { if (!AC) try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} if (AC && AC.state === 'suspended') AC.resume(); }
+function tone(f, d, v, type = 'square', when = 0) {
+  if (!AC || !AYAR.ses) return;
+  const t = AC.currentTime + when, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t); o.frequency.exponentialRampToValueAtTime(f * 1.5, t + d);
+  g.gain.setValueAtTime(v, t); g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  o.connect(g).connect(AC.destination); o.start(t); o.stop(t + d + 0.02);
+}
+function blip() { const n = performance.now(); if (n - lastBlip < 70) return; lastBlip = n; tone(520 + Math.random() * 200, 0.06, 0.04); }
+function chime() { tone(880, 0.12, 0.05, 'triangle'); tone(1320, 0.15, 0.04, 'triangle', 0.08); }
+function fanfare() { [523, 659, 784, 1046].forEach((f, i) => tone(f, 0.25, 0.07, 'triangle', i * 0.15)); }
+
+/* ---------- Grafik hazırlığı ---------- */
+function makeApple(s, gold) {
+  const c = document.createElement('canvas'); c.width = c.height = s; const g = c.getContext('2d');
+  const cx = s / 2, cy = s * 0.57, r = s * 0.34;
+  g.fillStyle = 'rgba(0,0,0,.35)'; g.beginPath(); g.ellipse(cx, s * 0.9, r * 0.9, r * 0.22, 0, 0, 7); g.fill();
+  const grd = g.createRadialGradient(cx - r * .4, cy - r * .4, r * .1, cx, cy, r * 1.3);
+  if (gold) { grd.addColorStop(0, '#fff6b0'); grd.addColorStop(.5, '#ffc61a'); grd.addColorStop(1, '#b37400'); }
+  else { grd.addColorStop(0, '#ff8a80'); grd.addColorStop(.5, '#f2263a'); grd.addColorStop(1, '#8e0016'); }
+  g.fillStyle = grd; g.beginPath();
+  g.arc(cx - r * 0.38, cy, r * 0.8, 0, 7); g.arc(cx + r * 0.38, cy, r * 0.8, 0, 7); g.fill();
+  g.beginPath(); g.ellipse(cx, cy + r * .25, r * .9, r * .7, 0, 0, 7); g.fill();
+  g.fillStyle = 'rgba(255,255,255,.55)'; g.beginPath(); g.ellipse(cx - r * .45, cy - r * .3, r * .18, r * .28, -.5, 0, 7); g.fill();
+  g.strokeStyle = '#5b3a1a'; g.lineWidth = s * .06; g.lineCap = 'round';
+  g.beginPath(); g.moveTo(cx, cy - r * .6); g.quadraticCurveTo(cx + 1, cy - r * 1.2, cx + r * .2, cy - r * 1.35); g.stroke();
+  g.fillStyle = '#3fd36b'; g.beginPath(); g.ellipse(cx + r * .55, cy - r * 1.05, r * .42, r * .2, -.5, 0, 7); g.fill();
+  return c;
+}
+const APPLE = makeApple(CELL, false), GOLD = makeApple(CELL, true);
+
+const BG = document.createElement('canvas'); BG.width = VW; BG.height = VH;
+(function drawBG() {
+  const g = BG.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, 0, VH); grd.addColorStop(0, '#120a2e'); grd.addColorStop(1, '#060818');
+  g.fillStyle = grd; g.fillRect(0, 0, VW, VH);
+  // gift bar
+  const bx = 24, bw = (VW - 48 - 4 * 12) / 5, by = 168, bh = 96;
+  AYAR.bar.forEach((b, i) => {
+    const x = bx + i * (bw + 12);
+    g.fillStyle = 'rgba(255,255,255,.08)'; rr(g, x, by, bw, bh, 22); g.fill();
+    g.strokeStyle = 'rgba(160,120,255,.55)'; g.lineWidth = 3; rr(g, x, by, bw, bh, 22); g.stroke();
+    g.textBaseline = 'middle'; g.textAlign = 'left';
+    g.font = '36px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif';
+    const iw = g.measureText(b.ikon).width;
+    g.font = 'bold 26px Segoe UI,Arial'; const tw = g.measureText(b.yazi).width;
+    const total = iw + 6 + tw + 4 + 38; let x0 = x + (bw - total) / 2;
+    g.font = '36px "Segoe UI Emoji","Apple Color Emoji","Noto Color Emoji",sans-serif'; g.fillStyle = '#fff';
+    g.fillText(b.ikon, x0, by + bh / 2 + 2); x0 += iw + 6;
+    g.font = 'bold 26px Segoe UI,Arial'; g.fillStyle = '#fff'; g.fillText(b.yazi, x0, by + bh / 2 + 2); x0 += tw + 4;
+    g.drawImage(APPLE, x0 - 2, by + bh / 2 - 21, 42, 42);
+  });
+  // board
+  g.fillStyle = '#0b1230'; rr(g, BX - 10, BY - 10, W * CELL + 20, H * CELL + 20, 18); g.fill();
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    g.fillStyle = (x + y) & 1 ? '#121c45' : '#0f1840';
+    g.fillRect(BX + x * CELL, BY + y * CELL, CELL, CELL);
+  }
+  g.strokeStyle = 'rgba(140,110,255,.6)'; g.lineWidth = 4; rr(g, BX - 6, BY - 6, W * CELL + 12, H * CELL + 12, 14); g.stroke();
+})();
+function rr(g, x, y, w, h, r) { g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r); g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath(); }
+
+const picCache = new Map();
+function pic(url) {
+  if (!url) return null;
+  let im = picCache.get(url);
+  if (!im) { im = new Image(); im.src = url; picCache.set(url, im); if (picCache.size > 200) picCache.delete(picCache.keys().next().value); }
+  return im.complete && im.naturalWidth ? im : null;
+}
+
+/* ---------- Efektler ---------- */
+const cx = c => BX + (c % W) * CELL + CELL / 2, cy = c => BY + ((c / W) | 0) * CELL + CELL / 2;
+function burst(c, gold) {
+  if (parts.length > 260) return;
+  for (let i = 0; i < 7; i++) {
+    const a = Math.random() * 6.28, s = 2 + Math.random() * 5;
+    parts.push({ x: cx(c), y: cy(c), vx: Math.cos(a) * s, vy: Math.sin(a) * s, life: 1, col: gold ? '#ffd23f' : (i & 1 ? '#ff4d5e' : '#7dff9a'), r: 5 });
+  }
+}
+function confetti() {
+  for (let i = 0; i < 260; i++) parts.push({ x: VW / 2, y: BY + H * CELL / 2, vx: (Math.random() - .5) * 26, vy: -Math.random() * 26, life: 2.2, col: `hsl(${Math.random() * 360},90%,60%)`, r: 7, g: .5 });
+}
+
+/* ---------- Çizim ---------- */
+let hue = 0;
+function draw(now) {
+  ctx.drawImage(BG, 0, 0);
+  hue = (hue + 0.6) % 360;
+
+  // başlık
+  ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+  ctx.font = '900 64px Segoe UI,Arial';
+  const tg = ctx.createLinearGradient(30, 0, 560, 0);
+  tg.addColorStop(0, `hsl(${hue},90%,65%)`); tg.addColorStop(1, `hsl(${(hue + 120) % 360},90%,65%)`);
+  ctx.fillStyle = tg; ctx.fillText('ELMA YILANI', 30, 62);
+  ctx.textAlign = 'right'; ctx.font = 'bold 40px Segoe UI,Arial'; ctx.fillStyle = '#ffd23f';
+  ctx.fillText('TUR ' + round, VW - 30, 52);
+  ctx.font = '26px Segoe UI,Arial'; ctx.fillStyle = conn.ok ? '#6dff9b' : (DEMO ? '#ffb74d' : '#ff6b6b');
+  ctx.fillText(DEMO ? '● DEMO' : conn.ok ? '● CANLI BAĞLI' : '● bağlanıyor…', VW - 30, 96);
+  // doluluk çubuğu
+  const pct = bLen / N;
+  ctx.fillStyle = 'rgba(255,255,255,.1)'; rr(ctx, 30, 118, VW - 60, 30, 15); ctx.fill();
+  const pg = ctx.createLinearGradient(30, 0, VW - 30, 0);
+  pg.addColorStop(0, `hsl(${hue},90%,55%)`); pg.addColorStop(1, `hsl(${(hue + 90) % 360},90%,55%)`);
+  ctx.fillStyle = pg; rr(ctx, 30, 118, Math.max(30, (VW - 60) * pct), 30, 15); ctx.fill();
+  ctx.textAlign = 'center'; ctx.font = 'bold 22px Segoe UI,Arial'; ctx.fillStyle = '#fff';
+  ctx.fillText(`Tahta %${Math.floor(pct * 100)} dolu  ·  ${bLen}/${N}`, VW / 2, 134);
+
+  // elmalar
+  for (const [c, a] of apples) {
+    const p = Math.min(1, Math.max(0, (now - a.t0) / 450));
+    if (p <= 0) continue;
+    const e = 1 - Math.pow(1 - p, 3);
+    const yy = BY + ((c / W) | 0) * CELL - (1 - e) * 260;
+    const bounce = p >= 1 ? Math.sin((now + c * 37) / 300) * 1.5 : 0;
+    ctx.globalAlpha = Math.min(1, p * 2);
+    ctx.drawImage(a.gold ? GOLD : APPLE, BX + (c % W) * CELL, yy + bounce);
+  }
+  ctx.globalAlpha = 1;
+
+  // yılan (labirent görünümlü gövde)
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  const lw = CELL * 0.74;
+  ctx.lineWidth = lw + 6; ctx.strokeStyle = 'rgba(0,0,0,.55)';
+  ctx.beginPath(); ctx.moveTo(cx(seg(bLen - 1)), cy(seg(bLen - 1)));
+  for (let i = bLen - 2; i >= 0; i--) ctx.lineTo(cx(seg(i)), cy(seg(i)));
+  ctx.stroke();
+  ctx.lineWidth = lw;
+  for (let i = bLen - 1; i > 0; i--) {
+    const a = seg(i), b = seg(i - 1);
+    ctx.strokeStyle = `hsl(${(hue + i * 3) % 360},85%,${i % 2 ? 52 : 57}%)`;
+    ctx.beginPath(); ctx.moveTo(cx(a), cy(a)); ctx.lineTo(cx(b), cy(b)); ctx.stroke();
+  }
+  // gövde ortası parlak çizgi
+  ctx.lineWidth = lw * 0.18; ctx.strokeStyle = 'rgba(255,255,255,.22)';
+  ctx.beginPath(); ctx.moveTo(cx(seg(bLen - 1)), cy(seg(bLen - 1)));
+  for (let i = bLen - 2; i >= 0; i--) ctx.lineTo(cx(seg(i)), cy(seg(i)));
+  ctx.stroke();
+  drawHead(now);
+
+  // partiküller
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i]; p.x += p.vx; p.y += p.vy; p.vy += p.g || 0.15; p.vx *= .97; p.life -= 0.03;
+    if (p.life <= 0) { parts.splice(i, 1); continue; }
+    ctx.globalAlpha = Math.min(1, p.life); ctx.fillStyle = p.col;
+    ctx.fillRect(p.x - p.r / 2, p.y - p.r / 2, p.r, p.r);
+  }
+  ctx.globalAlpha = 1;
+
+  // hediye bildirimleri (tahtanın üstünde)
+  let ty = BY + 40;
+  for (let i = toasts.length - 1; i >= 0; i--) {
+    const t = toasts[i], age = now - t.t;
+    if (age > 3500) { toasts.splice(i, 1); continue; }
+    const a = Math.min(1, age / 200, (3500 - age) / 400);
+    ctx.globalAlpha = a; ctx.font = 'bold 34px Segoe UI,Arial'; ctx.textAlign = 'center';
+    const w = ctx.measureText(t.txt).width + 50;
+    ctx.fillStyle = 'rgba(10,6,30,.82)'; rr(ctx, VW / 2 - w / 2, ty - 30, w, 60, 30); ctx.fill();
+    ctx.strokeStyle = '#ffd23f'; ctx.lineWidth = 3; ctx.stroke();
+    ctx.fillStyle = '#fff'; ctx.fillText(t.txt, VW / 2, ty + 2);
+    ty += 72;
+  }
+  ctx.globalAlpha = 1;
+
+  // tur bitti
+  if (state === 'win') {
+    const a = Math.min(1, (now - winT) / 500);
+    ctx.fillStyle = `rgba(0,0,0,${.55 * a})`; ctx.fillRect(BX, BY, W * CELL, H * CELL);
+    ctx.textAlign = 'center'; ctx.globalAlpha = a;
+    ctx.font = '900 92px Segoe UI,Arial'; ctx.fillStyle = `hsl(${hue},95%,65%)`;
+    ctx.fillText('TAHTA DOLDU!', VW / 2, BY + H * CELL / 2 - 50);
+    ctx.font = 'bold 48px Segoe UI,Arial'; ctx.fillStyle = '#fff';
+    ctx.fillText(`Tur ${round} tamamlandı 🎉`, VW / 2, BY + H * CELL / 2 + 40);
+    ctx.font = '34px Segoe UI,Arial'; ctx.fillStyle = '#ffd23f';
+    ctx.fillText('Hediyeleriniz için teşekkürler!', VW / 2, BY + H * CELL / 2 + 100);
+    ctx.globalAlpha = 1;
+  }
+
+  drawPanel(now);
+}
+
+function drawHead(now) {
+  const h = head(), x = cx(h), y = cy(h);
+  const ang = dir === 1 ? 0 : dir === -1 ? Math.PI : dir === W ? Math.PI / 2 : -Math.PI / 2;
+  ctx.save(); ctx.translate(x, y); ctx.rotate(ang);
+  // dil
+  if (Math.sin(now / 120) > 0) {
+    ctx.strokeStyle = '#ff2d55'; ctx.lineWidth = 4; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(CELL * .4, 0); ctx.lineTo(CELL * .7, 0); ctx.lineTo(CELL * .82, -7);
+    ctx.moveTo(CELL * .7, 0); ctx.lineTo(CELL * .82, 7); ctx.stroke();
+  }
+  ctx.fillStyle = `hsl(${hue % 360},90%,60%)`;
+  ctx.beginPath(); ctx.ellipse(4, 0, CELL * .48, CELL * .42, 0, 0, 7); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,.5)'; ctx.lineWidth = 3; ctx.stroke();
+  for (const s of [-1, 1]) {
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(10, s * 10, 8, 0, 7); ctx.fill();
+    ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(13, s * 10, 4.2, 0, 7); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawPanel(now) {
+  const py = BY + H * CELL + 26;
+  // sol: liderler
+  ctx.fillStyle = 'rgba(255,255,255,.06)'; rr(ctx, 24, py, 620, VH - py - 24, 24); ctx.fill();
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 32px Segoe UI,Arial'; ctx.fillStyle = '#ffd23f';
+  ctx.fillText('🏆 EN ÇOK ELMA ATANLAR', 46, py + 38);
+  const top = [...board.values()].filter(r => r.apples > 0).sort((a, b) => b.apples - a.apples).slice(0, 5);
+  const medal = ['🥇', '🥈', '🥉', '4.', '5.'];
+  top.forEach((r, i) => {
+    const y = py + 86 + i * 50;
+    ctx.font = '30px "Segoe UI Emoji",Segoe UI,Arial'; ctx.fillStyle = '#fff'; ctx.fillText(medal[i], 46, y);
+    const im = pic(r.pic);
+    if (im) { ctx.save(); ctx.beginPath(); ctx.arc(116, y, 22, 0, 7); ctx.clip(); ctx.drawImage(im, 94, y - 22, 44, 44); ctx.restore(); }
+    else { ctx.fillStyle = `hsl(${(r.name.length * 47) % 360},60%,45%)`; ctx.beginPath(); ctx.arc(116, y, 22, 0, 7); ctx.fill();
+      ctx.fillStyle = '#fff'; ctx.font = 'bold 22px Segoe UI'; ctx.textAlign = 'center'; ctx.fillText((r.name[0] || '?').toUpperCase(), 116, y + 1); ctx.textAlign = 'left'; }
+    ctx.font = 'bold 28px Segoe UI,Arial'; ctx.fillStyle = '#fff';
+    let nm = r.name; while (ctx.measureText(nm).width > 330 && nm.length > 3) nm = nm.slice(0, -2);
+    if (nm !== r.name) nm += '…';
+    ctx.fillText(nm, 150, y);
+    ctx.textAlign = 'right'; ctx.fillStyle = '#ff6b7a'; ctx.fillText(r.apples + ' 🍎', 624, y); ctx.textAlign = 'left';
+  });
+  if (!top.length) { ctx.font = '26px Segoe UI'; ctx.fillStyle = '#8ea0c9'; ctx.fillText('İlk hediyeyi sen at, listeye gir!', 46, py + 100); }
+
+  // sağ: sayaçlar
+  const rx = 664, rw = VW - rx - 24;
+  ctx.fillStyle = 'rgba(255,255,255,.06)'; rr(ctx, rx, py, rw, VH - py - 24, 24); ctx.fill();
+  const stat = (lbl, val, y, col) => {
+    ctx.textAlign = 'left'; ctx.font = '24px Segoe UI'; ctx.fillStyle = '#a9b6dc'; ctx.fillText(lbl, rx + 22, y);
+    ctx.textAlign = 'right'; ctx.font = 'bold 34px Segoe UI'; ctx.fillStyle = col; ctx.fillText(val, rx + rw - 22, y);
+  };
+  stat('Düşecek elma', pending, py + 42, '#ffd23f');
+  stat('Tahtadaki', apples.size, py + 96, '#ff6b7a');
+  stat('Bu tur yenen', eatenRound, py + 150, '#6dff9b');
+  stat('Toplam yenen', totalEaten, py + 204, '#7fd1ff');
+  // beğeni ilerleme
+  const lp = (likesTotal % AYAR.begeniBasina) / AYAR.begeniBasina;
+  ctx.textAlign = 'left'; ctx.font = '24px Segoe UI'; ctx.fillStyle = '#a9b6dc';
+  ctx.fillText(`❤️ Sonraki elmaya: ${AYAR.begeniBasina - (likesTotal % AYAR.begeniBasina)} beğeni`, rx + 22, py + 258);
+  ctx.fillStyle = 'rgba(255,255,255,.12)'; rr(ctx, rx + 22, py + 282, rw - 44, 18, 9); ctx.fill();
+  ctx.fillStyle = '#ff3d7f'; rr(ctx, rx + 22, py + 282, Math.max(18, (rw - 44) * lp), 18, 9); ctx.fill();
+}
+
+/* ---------- Ana döngü ---------- */
+let acc = 0, last = performance.now();
+newRound();
+function loop(now) {
+  const dt = Math.min(250, now - last); last = now;
+  if (state === 'play') {
+    spawnTick(now);
+    const load = apples.size + pending;
+    const sps = load === 0 ? 7 : Math.min(48, 11 + apples.size * 0.22 + Math.min(pending, 400) * 0.03);
+    acc += dt * sps / 1000;
+    let guard = 12;
+    while (acc >= 1 && guard-- > 0 && state === 'play') { step(); acc -= 1; }
+    if (guard <= 0) acc = 0;
+    if (AYAR.bedavaElmaSn > 0 && load === 0 && now - lastAppleTime > AYAR.bedavaElmaSn * 1000) {
+      pending += 1; lastAppleTime = now;
+      toasts.push({ txt: '🎁 Bedava elma! Hediye at, yılan büyüsün', t: now });
+    }
+  } else if (state === 'win' && now - winT > 6500) {
+    round++; newRound();
+  }
+  draw(now);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// Test/otomasyon için dışarı aç
+window.__game = { spawnTick, occ, onGift, onFollow, onLike, get len() { return bLen; }, get state() { return state; }, step, get pending() { return pending; }, apples, newRound };
+</script>
+</body>
+</html>
